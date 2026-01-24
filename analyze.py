@@ -32,6 +32,13 @@ class AnalysisResult:
     sessions: list = field(default_factory=list)
     first_event: float = 0
     last_event: float = 0
+    # New fields for enhanced analysis
+    hold_durations: dict = field(default_factory=lambda: defaultdict(list))  # key -> [durations]
+    long_holds: list = field(default_factory=list)  # [(key, duration_ms, timestamp)]
+    idle_times: list = field(default_factory=list)  # [idle_ms values]
+    hourly_stats: dict = field(default_factory=lambda: defaultdict(lambda: {"presses": 0, "errors": 0, "chars": 0}))
+    typo_sequences: list = field(default_factory=list)  # [(before, after, count)]
+    raw_events: list = field(default_factory=list)  # For typo detection
 
 
 def is_printable_key(key: str) -> bool:
@@ -65,7 +72,7 @@ def load_events(path: Path, start_date: datetime | None = None, end_date: dateti
     return sorted(events, key=lambda e: e["timestamp"])
 
 
-def analyze(events: list[dict], session_gap: float = 60.0) -> AnalysisResult:
+def analyze(events: list[dict], session_gap: float = 60.0, long_hold_threshold_ms: int = 200) -> AnalysisResult:
     """Analyze keystroke events."""
     result = AnalysisResult()
 
@@ -74,6 +81,7 @@ def analyze(events: list[dict], session_gap: float = 60.0) -> AnalysisResult:
 
     result.first_event = events[0]["timestamp"]
     result.last_event = events[-1]["timestamp"]
+    result.raw_events = events  # Store for typo detection
 
     # Track state
     prev_key = None
@@ -84,15 +92,34 @@ def analyze(events: list[dict], session_gap: float = 60.0) -> AnalysisResult:
 
     for event in events:
         result.total_keystrokes += 1
+        ts = event["timestamp"]
+        key = event["key"]
+
+        # Track hold durations from release events
+        if event["event"] == "release" and "hold_duration_ms" in event:
+            hold_ms = event["hold_duration_ms"]
+            result.hold_durations[key].append(hold_ms)
+            if hold_ms >= long_hold_threshold_ms:
+                result.long_holds.append((key, hold_ms, ts))
 
         if event["event"] != "press":
             continue
 
         result.total_press_events += 1
-        key = event["key"]
-        ts = event["timestamp"]
 
         result.key_frequency[key] += 1
+
+        # Track idle times
+        if "idle_before_ms" in event:
+            result.idle_times.append(event["idle_before_ms"])
+
+        # Track hourly stats
+        hour = datetime.fromtimestamp(ts).hour
+        result.hourly_stats[hour]["presses"] += 1
+        if is_printable_key(key):
+            result.hourly_stats[hour]["chars"] += 1
+        if key == "KEY_BACKSPACE":
+            result.hourly_stats[hour]["errors"] += 1
 
         # Track sessions
         if session_start is None:
@@ -141,7 +168,182 @@ def analyze(events: list[dict], session_gap: float = 60.0) -> AnalysisResult:
             chars=session_chars
         ))
 
+    # Detect typo patterns
+    result.typo_sequences = detect_typo_patterns(events)
+
     return result
+
+
+def key_to_char(key: str, shift_active: bool = False) -> str | None:
+    """Convert KEY_* code to character. Returns None for non-printable keys."""
+    if key.startswith("KEY_") and len(key) == 5 and key[4].isalpha():
+        char = key[4].lower()
+        return char.upper() if shift_active else char
+    if key == "KEY_SPACE":
+        return " "
+    if key.startswith("KEY_") and len(key) == 5 and key[4].isdigit():
+        return key[4]
+    return None
+
+
+def detect_typo_patterns(events: list[dict]) -> list[tuple[str, str, int]]:
+    """Detect typo patterns: sequences typed, deleted, then retyped differently.
+
+    Returns list of (original, corrected, count) tuples.
+    """
+    typo_counts: Counter = Counter()
+
+    # Build sequence of characters with backspace markers
+    press_events = [e for e in events if e["event"] == "press"]
+
+    i = 0
+    while i < len(press_events):
+        # Look for backspace sequences
+        if press_events[i]["key"] == "KEY_BACKSPACE":
+            # Count consecutive backspaces
+            backspace_count = 0
+            j = i
+            while j < len(press_events) and press_events[j]["key"] == "KEY_BACKSPACE":
+                backspace_count += 1
+                j += 1
+
+            # Get characters before backspaces (what was deleted)
+            deleted_chars = []
+            shift_active = False
+            for k in range(max(0, i - backspace_count - 5), i):
+                key = press_events[k]["key"]
+                if key in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
+                    shift_active = True
+                    continue
+                char = key_to_char(key, shift_active)
+                if char:
+                    deleted_chars.append(char)
+                shift_active = False
+
+            deleted = "".join(deleted_chars[-backspace_count:]) if deleted_chars else ""
+
+            # Get characters after backspaces (replacement)
+            replacement_chars = []
+            shift_active = False
+            for k in range(j, min(j + len(deleted) + 2, len(press_events))):
+                key = press_events[k]["key"]
+                if key == "KEY_BACKSPACE":
+                    break
+                if key in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
+                    shift_active = True
+                    continue
+                char = key_to_char(key, shift_active)
+                if char:
+                    replacement_chars.append(char)
+                shift_active = False
+
+            replacement = "".join(replacement_chars[:len(deleted) + 1])
+
+            # Record if we found a meaningful pattern
+            if len(deleted) >= 2 and len(replacement) >= 2 and deleted != replacement:
+                typo_counts[(deleted, replacement)] += 1
+
+            i = j
+        else:
+            i += 1
+
+    # Return top patterns
+    return [(orig, repl, count) for (orig, repl), count in typo_counts.most_common(20)]
+
+
+def compute_time_of_day_stats(result: AnalysisResult) -> dict:
+    """Compute typing stats by time of day periods."""
+    periods = {
+        "morning": range(6, 12),
+        "afternoon": range(12, 18),
+        "evening": range(18, 24),
+        "night": list(range(0, 6)),
+    }
+
+    period_stats = {}
+    for period_name, hours in periods.items():
+        presses = sum(result.hourly_stats[h]["presses"] for h in hours)
+        errors = sum(result.hourly_stats[h]["errors"] for h in hours)
+        chars = sum(result.hourly_stats[h]["chars"] for h in hours)
+
+        if presses > 0:
+            period_stats[period_name] = {
+                "presses": presses,
+                "errors": errors,
+                "chars": chars,
+                "error_rate": errors / presses if presses else 0,
+            }
+
+    return period_stats
+
+
+def compute_fatigue_analysis(result: AnalysisResult, window_minutes: int = 10) -> list[dict]:
+    """Analyze error rate trends within sessions to detect fatigue.
+
+    Returns list of session analyses with fatigue indicators.
+    """
+    fatigue_data = []
+
+    for session in result.sessions:
+        session_duration = session.end - session.start
+        if session_duration < window_minutes * 60:  # Skip short sessions
+            continue
+
+        # Get events in this session
+        session_events = [
+            e for e in result.raw_events
+            if session.start <= e["timestamp"] <= session.end and e["event"] == "press"
+        ]
+
+        if len(session_events) < 20:  # Need enough data
+            continue
+
+        # Split into windows
+        windows = []
+        window_start = session.start
+        while window_start < session.end:
+            window_end = window_start + (window_minutes * 60)
+            window_events = [
+                e for e in session_events
+                if window_start <= e["timestamp"] < window_end
+            ]
+            if window_events:
+                errors = sum(1 for e in window_events if e["key"] == "KEY_BACKSPACE")
+                error_rate = errors / len(window_events) if window_events else 0
+                windows.append({"error_rate": error_rate, "events": len(window_events)})
+            window_start = window_end
+
+        if len(windows) >= 2:
+            first_rate = windows[0]["error_rate"]
+            last_rate = windows[-1]["error_rate"]
+            change_pct = ((last_rate - first_rate) / first_rate * 100) if first_rate > 0 else 0
+
+            fatigue_data.append({
+                "duration_minutes": session_duration / 60,
+                "windows": len(windows),
+                "start_error_rate": first_rate,
+                "end_error_rate": last_rate,
+                "change_percent": change_pct,
+                "fatigue_detected": change_pct > 50,
+            })
+
+    return fatigue_data
+
+
+def compute_rolling_stats(events: list[dict], days: int) -> dict | None:
+    """Compute stats for the past N days."""
+    if not events:
+        return None
+
+    cutoff = datetime.now().timestamp() - (days * 24 * 3600)
+    filtered = [e for e in events if e["timestamp"] >= cutoff]
+
+    if not filtered:
+        return None
+
+    result = analyze(filtered)
+    stats = compute_stats(result)
+    return stats
 
 
 def compute_stats(result: AnalysisResult) -> dict:
@@ -193,6 +395,59 @@ def compute_stats(result: AnalysisResult) -> dict:
         stats["average_wpm"] = (total_chars / 5) / total_time_min
     else:
         stats["average_wpm"] = 0
+
+    # --- NEW STATS ---
+
+    # Hold duration stats
+    if result.hold_durations:
+        hold_stats = {}
+        for key, durations in result.hold_durations.items():
+            if len(durations) >= 3:
+                hold_stats[key] = {
+                    "avg": statistics.mean(durations),
+                    "max": max(durations),
+                    "count": len(durations),
+                }
+        # Sort by max hold duration to find problematic keys
+        stats["hold_duration_stats"] = sorted(
+            hold_stats.items(),
+            key=lambda x: x[1]["max"],
+            reverse=True
+        )[:15]
+
+    # Long holds (potential accidental modifier activations)
+    stats["long_holds"] = [
+        {"key": k, "duration_ms": d, "timestamp": datetime.fromtimestamp(ts).isoformat()}
+        for k, d, ts in result.long_holds[-20:]  # Last 20
+    ]
+
+    # Idle time distribution
+    if result.idle_times:
+        short_idles = sum(1 for t in result.idle_times if t < 100)
+        medium_idles = sum(1 for t in result.idle_times if 100 <= t < 500)
+        long_idles = sum(1 for t in result.idle_times if 500 <= t < 2000)
+        very_long_idles = sum(1 for t in result.idle_times if t >= 2000)
+
+        stats["idle_time_distribution"] = {
+            "short_under_100ms": short_idles,
+            "medium_100_500ms": medium_idles,
+            "long_500_2000ms": long_idles,
+            "very_long_over_2000ms": very_long_idles,
+            "avg_idle_ms": statistics.mean(result.idle_times) if result.idle_times else 0,
+            "median_idle_ms": statistics.median(result.idle_times) if result.idle_times else 0,
+        }
+
+    # Time of day stats
+    stats["time_of_day"] = compute_time_of_day_stats(result)
+
+    # Fatigue analysis
+    stats["fatigue_analysis"] = compute_fatigue_analysis(result)
+
+    # Typo patterns
+    stats["typo_patterns"] = [
+        {"original": orig, "corrected": corr, "count": count}
+        for orig, corr, count in result.typo_sequences[:10]
+    ]
 
     return stats
 

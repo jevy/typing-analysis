@@ -59,6 +59,11 @@ def log_events(device: evdev.InputDevice, output_path: Path, verbose: bool = Fal
     print(f"Output file: {output_path}")
     print("Press Ctrl+C to stop\n")
 
+    # Track press times for hold duration calculation
+    key_press_times: dict[int, float] = {}
+    # Track last event time for idle calculation
+    last_event_time: float | None = None
+
     with open(output_path, "a") as f:
         try:
             for event in device.read_loop():
@@ -74,20 +79,44 @@ def log_events(device: evdev.InputDevice, output_path: Path, verbose: bool = Fal
                 if isinstance(key_name, list):
                     key_name = key_name[0]
 
+                ts = event.timestamp()
+
                 record = {
-                    "timestamp": event.timestamp(),
-                    "datetime": datetime.fromtimestamp(event.timestamp()).isoformat(),
+                    "timestamp": ts,
+                    "datetime": datetime.fromtimestamp(ts).isoformat(),
                     "code": event.code,
                     "key": key_name,
                     "event": event_type,
                 }
+
+                # Calculate idle time for press events
+                if event_type == "press":
+                    if last_event_time is not None:
+                        idle_ms = int((ts - last_event_time) * 1000)
+                        record["idle_before_ms"] = idle_ms
+                    # Track press time for hold duration
+                    key_press_times[event.code] = ts
+
+                # Calculate hold duration for release events
+                elif event_type == "release":
+                    if event.code in key_press_times:
+                        hold_duration_ms = int((ts - key_press_times[event.code]) * 1000)
+                        record["hold_duration_ms"] = hold_duration_ms
+                        del key_press_times[event.code]
+
+                last_event_time = ts
 
                 line = json.dumps(record)
                 f.write(line + "\n")
                 f.flush()
 
                 if verbose:
-                    print(f"{record['datetime']} {key_name:20} {event_type}")
+                    extra = ""
+                    if "hold_duration_ms" in record:
+                        extra = f" (held {record['hold_duration_ms']}ms)"
+                    elif "idle_before_ms" in record:
+                        extra = f" (idle {record['idle_before_ms']}ms)"
+                    print(f"{record['datetime']} {key_name:20} {event_type}{extra}")
 
         except KeyboardInterrupt:
             print("\nStopped logging.")
