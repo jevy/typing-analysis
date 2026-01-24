@@ -19,6 +19,8 @@
         }
       );
 
+      homeManagerModules.default = ./module.nix;
+
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};

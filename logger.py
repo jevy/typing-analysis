@@ -28,10 +28,18 @@ def find_keyboards() -> list[evdev.InputDevice]:
 
 
 def select_keyboard(keyboards: list[evdev.InputDevice]) -> evdev.InputDevice | None:
-    """Let user select a keyboard if multiple found."""
+    """Let user select a keyboard if multiple found.
+
+    In non-interactive mode (no TTY), auto-selects the first keyboard.
+    """
     if not keyboards:
         return None
     if len(keyboards) == 1:
+        return keyboards[0]
+
+    # Non-interactive mode: auto-select first keyboard
+    if not sys.stdin.isatty():
+        print(f"Multiple keyboards found, auto-selecting: {keyboards[0].name} ({keyboards[0].path})")
         return keyboards[0]
 
     print("Multiple keyboards found:")

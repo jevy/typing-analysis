@@ -10,19 +10,20 @@ in {
     device = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "Specific input device path (e.g., /dev/input/event3). Auto-detects if null.";
+      description = "Specific input device path (e.g., /dev/input/event3). Auto-selects first keyboard if null.";
     };
 
     logPath = lib.mkOption {
       type = lib.types.str;
-      default = "$HOME/.local/share/typing-analysis/keystrokes.jsonl";
-      description = "Path to store keystroke logs.";
+      default = "%h/.local/share/typing-analysis/keystrokes.jsonl";
+      description = "Path to store keystroke logs. %h expands to home directory.";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    # Add user to input group to read /dev/input/*
-    users.groups.input.members = [ config.users.users.${config.home.username}.name ];
+    # NOTE: User must be in 'input' group. Add to NixOS config:
+    # users.users.yourname.extraGroups = [ "input" ];
+    # Or: users.groups.input.members = [ "yourname" ];
 
     home.packages = [ typing-analysis ];
 
