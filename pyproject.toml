@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "typing-analysis"
+version = "0.1.0"
+description = "Keystroke capture and analysis for improving typing skills"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "evdev",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+py-modules = ["logger", "analyze", "report"]
+
+[project.scripts]
+typing-log = "logger:main"
+typing-analyze = "analyze:main"
+typing-report = "report:main"
