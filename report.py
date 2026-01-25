@@ -76,6 +76,49 @@ def print_report(stats: dict, rolling_stats: dict | None = None):
         print(f"{'Error Rate:':20} {today_err:>11.1f}% {week_err:>11.1f}% {month_err:>11.1f}%")
         print()
 
+    # Homerow mod analysis (new comprehensive section)
+    if stats.get("homerow_mods"):
+        hrm = stats["homerow_mods"]
+        print("HOMEROW MOD ANALYSIS")
+        print("-" * 40)
+
+        # Summary
+        if hrm.get("summary"):
+            s = hrm["summary"]
+            print(f"  Total mod+key sequences: {s.get('total_mod_sequences', 0):,}")
+            print(f"  Average timing: {s.get('avg_timing_ms', 0):.0f}ms")
+            print(f"  Fastest: {s.get('min_timing_ms', 0):.0f}ms | Slowest: {s.get('max_timing_ms', 0):.0f}ms")
+            print(f"  95th percentile: {s.get('p95_timing_ms', 0):.0f}ms")
+            if s.get('total_failures', 0) > 0:
+                print(f"  Detected failures: {s['total_failures']} ({s.get('failure_rate_pct', 0):.1f}%)")
+            print()
+
+        # Recommendations based on failure analysis
+        if hrm.get("recommendations"):
+            print("  RECOMMENDATIONS:")
+            for rec in hrm["recommendations"]:
+                print(f"    * {rec['message']}")
+                if rec.get("detail"):
+                    print(f"      ({rec['detail']})")
+            print()
+
+        # Top mod sequences
+        if hrm.get("mod_sequences"):
+            print("  Most used mod+key combinations:")
+            for seq in hrm["mod_sequences"][:8]:
+                pct_fast = seq.get("under_tap_time_pct", 0)
+                flag = " <-- all under tap-time" if pct_fast == 100 else ""
+                print(f"    {seq['digraph']:12} count:{seq['count']:3}  avg:{seq['avg_ms']:>5.0f}ms  "
+                      f"min:{seq['min_ms']:>4.0f}ms{flag}")
+            print()
+
+        # Failures
+        if hrm.get("failures"):
+            print("  DETECTED MOD FAILURES (typed both keys, then backspaced):")
+            for f in hrm["failures"][:5]:
+                print(f"    {f['mod_key']}->{f['target_key']}: {f['count']} failures")
+            print()
+
     # Long key holds (homerow mod debugging)
     if stats.get("long_holds"):
         print("LONG KEY HOLDS (potential homerow mod issues)")

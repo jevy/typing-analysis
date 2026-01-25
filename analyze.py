@@ -39,6 +39,9 @@ class AnalysisResult:
     hourly_stats: dict = field(default_factory=lambda: defaultdict(lambda: {"presses": 0, "errors": 0, "chars": 0}))
     typo_sequences: list = field(default_factory=list)  # [(before, after, count)]
     raw_events: list = field(default_factory=list)  # For typo detection
+    # Homerow mod analysis
+    homerow_mod_timings: dict = field(default_factory=lambda: defaultdict(list))  # "D->I" -> [timing_ms]
+    homerow_mod_failures: list = field(default_factory=list)  # [(mod_key, target_key, timing_ms, corrected)]
 
 
 def is_printable_key(key: str) -> bool:
@@ -171,6 +174,11 @@ def analyze(events: list[dict], session_gap: float = 60.0, long_hold_threshold_m
     # Detect typo patterns
     result.typo_sequences = detect_typo_patterns(events)
 
+    # Analyze homerow mod timings
+    mod_timings, mod_failures = analyze_homerow_mods(events)
+    result.homerow_mod_timings = mod_timings
+    result.homerow_mod_failures = mod_failures
+
     return result
 
 
@@ -249,6 +257,205 @@ def detect_typo_patterns(events: list[dict]) -> list[tuple[str, str, int]]:
 
     # Return top patterns
     return [(orig, repl, count) for (orig, repl), count in typo_counts.most_common(20)]
+
+
+# Default homerow mod configuration (can be overridden)
+# Format: mod_key -> (modifier_name, intended_target_keys)
+DEFAULT_HOMEROW_MODS = {
+    "KEY_D": ("lshift", ["KEY_H", "KEY_J", "KEY_K", "KEY_L", "KEY_SEMICOLON",
+                         "KEY_Y", "KEY_U", "KEY_I", "KEY_O", "KEY_P",
+                         "KEY_N", "KEY_M", "KEY_COMMA", "KEY_DOT", "KEY_SLASH"]),
+    "KEY_K": ("rshift", ["KEY_A", "KEY_S", "KEY_D", "KEY_F", "KEY_G",
+                         "KEY_Q", "KEY_W", "KEY_E", "KEY_R", "KEY_T",
+                         "KEY_Z", "KEY_X", "KEY_C", "KEY_V", "KEY_B"]),
+    "KEY_S": ("lmeta", []),  # Super/Meta - bilateral
+    "KEY_L": ("rmeta", []),
+    "KEY_A": ("lalt", []),
+    "KEY_SEMICOLON": ("ralt", []),
+    "KEY_F": ("lctrl", []),
+    "KEY_J": ("rctrl", []),
+}
+
+
+def analyze_homerow_mods(events: list[dict], homerow_mods: dict = None) -> tuple[dict, list]:
+    """Analyze homerow mod key timings and detect failures.
+
+    Returns:
+        tuple: (mod_timings dict, failures list)
+        - mod_timings: {"D->I": [timing_ms, ...], ...}
+        - failures: [(mod_key, target_key, timing_ms, was_corrected), ...]
+    """
+    if homerow_mods is None:
+        homerow_mods = DEFAULT_HOMEROW_MODS
+
+    mod_timings = defaultdict(list)
+    failures = []
+
+    press_events = [e for e in events if e["event"] == "press"]
+
+    # Build list of (timestamp, key) for analysis
+    presses = [(e["timestamp"], e["key"]) for e in press_events]
+
+    # Track homerow mod -> target key sequences
+    for i, (ts, key) in enumerate(presses):
+        if key not in homerow_mods:
+            continue
+
+        mod_name, target_keys = homerow_mods[key]
+
+        # Look for next key press within a short window
+        for j in range(i + 1, min(i + 6, len(presses))):
+            ts2, key2 = presses[j]
+            delta_ms = (ts2 - ts) * 1000
+
+            # Stop looking if gap is too large (> 500ms)
+            if delta_ms > 500:
+                break
+
+            # Skip if it's another mod key or same key
+            if key2 in homerow_mods or key2 == key:
+                continue
+
+            # Record the timing
+            mod_key_name = key.replace("KEY_", "")
+            target_key_name = key2.replace("KEY_", "")
+            digraph = f"{mod_key_name}->{target_key_name}"
+            mod_timings[digraph].append(delta_ms)
+
+            # Check if this looks like a shift failure (d->i should be I, not di)
+            # A failure is when both keys appear in output followed by backspace
+            if mod_name in ("lshift", "rshift") and target_keys and key2 in target_keys:
+                # Look ahead for backspace within next few keys
+                backspace_found = False
+                for k in range(j + 1, min(j + 4, len(presses))):
+                    if presses[k][1] == "KEY_BACKSPACE":
+                        backspace_found = True
+                        break
+                    # If another letter is typed, probably not a correction
+                    if presses[k][1].startswith("KEY_") and len(presses[k][1]) == 5:
+                        break
+
+                if backspace_found:
+                    failures.append((mod_key_name, target_key_name, delta_ms, True))
+
+            break  # Only look at immediate next key
+
+    return dict(mod_timings), failures
+
+
+def compute_homerow_mod_stats(mod_timings: dict, failures: list, tap_time_ms: int = 200) -> dict:
+    """Compute statistics for homerow mod usage.
+
+    Args:
+        mod_timings: Dict of digraph -> [timing_ms, ...]
+        failures: List of (mod_key, target_key, timing_ms, was_corrected)
+        tap_time_ms: Current kanata tap-time setting for comparison
+
+    Returns:
+        Dict with homerow mod statistics
+    """
+    stats = {
+        "tap_time_setting": tap_time_ms,
+        "mod_sequences": [],
+        "failures": [],
+        "suggested_tap_time": None,
+        "summary": {},
+    }
+
+    all_timings = []
+
+    # Process each mod->key combination
+    for digraph, timings in sorted(mod_timings.items()):
+        if not timings:
+            continue
+
+        avg_ms = statistics.mean(timings)
+        min_ms = min(timings)
+        max_ms = max(timings)
+        count = len(timings)
+        under_tap_time = sum(1 for t in timings if t < tap_time_ms)
+
+        all_timings.extend(timings)
+
+        stats["mod_sequences"].append({
+            "digraph": digraph,
+            "count": count,
+            "avg_ms": avg_ms,
+            "min_ms": min_ms,
+            "max_ms": max_ms,
+            "under_tap_time": under_tap_time,
+            "under_tap_time_pct": (under_tap_time / count * 100) if count else 0,
+        })
+
+    # Sort by count (most used combinations first)
+    stats["mod_sequences"].sort(key=lambda x: -x["count"])
+
+    # Process failures
+    failure_counts = Counter()
+    for mod_key, target_key, timing_ms, corrected in failures:
+        failure_counts[(mod_key, target_key)] += 1
+
+    stats["failures"] = [
+        {"mod_key": mk, "target_key": tk, "count": count}
+        for (mk, tk), count in failure_counts.most_common(10)
+    ]
+
+    # Compute stats and recommendations based on actual typing speed
+    if all_timings:
+        sorted_timings = sorted(all_timings)
+        p95_index = int(len(sorted_timings) * 0.95)
+        p95_timing = sorted_timings[p95_index] if p95_index < len(sorted_timings) else sorted_timings[-1]
+        p50_timing = sorted_timings[len(sorted_timings) // 2]
+
+        stats["summary"] = {
+            "total_mod_sequences": len(all_timings),
+            "avg_timing_ms": statistics.mean(all_timings),
+            "min_timing_ms": min(all_timings),
+            "max_timing_ms": max(all_timings),
+            "median_timing_ms": p50_timing,
+            "p95_timing_ms": p95_timing,
+            "total_failures": len(failures),
+            "failure_rate_pct": (len(failures) / len(all_timings) * 100) if all_timings else 0,
+        }
+
+        # Generate recommendations based on failure patterns
+        recommendations = []
+
+        if failures:
+            # Get failure timings
+            failure_timings = [t for _, _, t, _ in failures]
+            avg_failure_timing = statistics.mean(failure_timings) if failure_timings else 0
+
+            # If failures happen at very fast timings, the issue is rollover/timing
+            if avg_failure_timing < 50:
+                recommendations.append({
+                    "type": "switch_algorithm",
+                    "message": "Switch to tap-hold-press-timeout - failures happen at very fast timings",
+                    "detail": f"Average failure timing: {avg_failure_timing:.0f}ms",
+                })
+
+            # If failures happen across various timings, consider bilateral
+            if len(set(f[0] for f in failures)) == 1:  # All failures on same mod key
+                mod_key = failures[0][0]
+                recommendations.append({
+                    "type": "bilateral",
+                    "message": f"Consider bilateral setup for {mod_key} - only trigger for opposite-hand keys",
+                    "detail": "Use tap-hold-release-keys to reduce false activations",
+                })
+
+            # General recommendation to lower tap-time if it might help
+            if avg_failure_timing < tap_time_ms * 0.5:
+                suggested = max(100, int(tap_time_ms * 0.75))
+                recommendations.append({
+                    "type": "lower_tap_time",
+                    "message": f"Try lowering tap-time from {tap_time_ms}ms to {suggested}ms",
+                    "detail": "May help with fast key rolls",
+                })
+
+        stats["recommendations"] = recommendations
+        stats["suggested_tap_time"] = None  # Deprecated in favor of recommendations
+
+    return stats
 
 
 def compute_time_of_day_stats(result: AnalysisResult) -> dict:
@@ -448,6 +655,14 @@ def compute_stats(result: AnalysisResult) -> dict:
         {"original": orig, "corrected": corr, "count": count}
         for orig, corr, count in result.typo_sequences[:10]
     ]
+
+    # Homerow mod analysis
+    if result.homerow_mod_timings:
+        stats["homerow_mods"] = compute_homerow_mod_stats(
+            result.homerow_mod_timings,
+            result.homerow_mod_failures,
+            tap_time_ms=200  # Default, could be made configurable
+        )
 
     return stats
 
