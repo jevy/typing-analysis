@@ -42,6 +42,8 @@ class AnalysisResult:
     # Homerow mod analysis
     homerow_mod_timings: dict = field(default_factory=lambda: defaultdict(list))  # "D->I" -> [timing_ms]
     homerow_mod_failures: list = field(default_factory=list)  # [(mod_key, target_key, timing_ms, corrected)]
+    # Backspace chain analysis
+    backspace_chains: dict = field(default_factory=dict)  # Result from analyze_backspace_chains
 
 
 def is_printable_key(key: str) -> bool:
@@ -181,6 +183,9 @@ def analyze(events: list[dict], session_gap: float = 60.0, long_hold_threshold_m
     mod_timings, mod_failures = analyze_homerow_mods(events)
     result.homerow_mod_timings = mod_timings
     result.homerow_mod_failures = mod_failures
+
+    # Analyze backspace chains to understand error root causes
+    result.backspace_chains = analyze_backspace_chains(events)
 
     return result
 
@@ -347,6 +352,95 @@ def analyze_homerow_mods(events: list[dict], homerow_mods: dict = None) -> tuple
             break  # Only look at immediate next key
 
     return dict(mod_timings), failures
+
+
+def analyze_backspace_chains(events: list[dict], context_len: int = 10) -> dict:
+    """Analyze what happens before and after backspace chains.
+
+    This helps identify the root cause of errors - what sequences lead to
+    needing to delete multiple characters.
+
+    Returns dict with:
+        - chains: list of {before: [], bs_count: int, after: []}
+        - immediate_before: Counter of keys immediately before chains
+        - sequences_before: Counter of 2-key sequences before chains
+        - chain_lengths: Counter of chain lengths
+        - retype_after: Counter of first key typed after chain
+        - root_causes: analyzed patterns (e.g., homerow mod misfires)
+    """
+    # Normalize keys helper
+    def normalize_key(k):
+        return k[-1] if isinstance(k, list) else k
+
+    press_events = [normalize_key(e["key"]) for e in events if e["event"] == "press"]
+
+    chains = []
+    i = 0
+    while i < len(press_events):
+        if press_events[i] == "KEY_BACKSPACE":
+            # Count consecutive backspaces
+            bs_count = 0
+            j = i
+            while j < len(press_events) and press_events[j] == "KEY_BACKSPACE":
+                bs_count += 1
+                j += 1
+
+            # Get context before and after
+            start = max(0, i - context_len)
+            before = press_events[start:i]
+            after = press_events[j:j+5] if j < len(press_events) else []
+
+            if bs_count >= 2:  # Only chains of 2+
+                chains.append({
+                    "before": before,
+                    "bs_count": bs_count,
+                    "after": after
+                })
+            i = j
+        else:
+            i += 1
+
+    # Analyze patterns
+    immediate_before = Counter()
+    sequences_before = Counter()
+    chain_lengths = Counter()
+    retype_after = Counter()
+    root_causes = Counter()
+
+    for ctx in chains:
+        chain_lengths[ctx["bs_count"]] += 1
+
+        if ctx["before"]:
+            key = ctx["before"][-1].replace("KEY_", "")
+            immediate_before[key] += 1
+
+            # Check for homerow mod misfire pattern: letter + SHIFT/SPACE before delete
+            if len(ctx["before"]) >= 2:
+                k1 = ctx["before"][-2].replace("KEY_", "")
+                k2 = ctx["before"][-1].replace("KEY_", "")
+                sequences_before[f"{k1}->{k2}"] += 1
+
+                # Detect homerow mod misfires
+                if k2 in ("LEFTSHIFT", "RIGHTSHIFT", "SPACE") and len(k1) == 1:
+                    root_causes["homerow_mod_misfire"] += 1
+                elif k2 == "CAPSLOCK":
+                    root_causes["capslock_escape"] += 1
+                elif k2 == "SPACE" and len(k1) == 1:
+                    root_causes["word_deletion"] += 1
+
+        if ctx["after"]:
+            key = ctx["after"][0].replace("KEY_", "")
+            retype_after[key] += 1
+
+    return {
+        "chains": chains,
+        "total_chains": len(chains),
+        "immediate_before": dict(immediate_before.most_common(20)),
+        "sequences_before": dict(sequences_before.most_common(30)),
+        "chain_lengths": dict(chain_lengths),
+        "retype_after": dict(retype_after.most_common(15)),
+        "root_causes": dict(root_causes),
+    }
 
 
 def compute_homerow_mod_stats(mod_timings: dict, failures: list, tap_time_ms: int = 200) -> dict:
@@ -669,6 +763,18 @@ def compute_stats(result: AnalysisResult) -> dict:
             result.homerow_mod_failures,
             tap_time_ms=200  # Default, could be made configurable
         )
+
+    # Backspace chain analysis (root cause of errors)
+    if result.backspace_chains:
+        bc = result.backspace_chains
+        stats["backspace_chains"] = {
+            "total_chains": bc.get("total_chains", 0),
+            "immediate_before": bc.get("immediate_before", {}),
+            "sequences_before": bc.get("sequences_before", {}),
+            "chain_lengths": bc.get("chain_lengths", {}),
+            "retype_after": bc.get("retype_after", {}),
+            "root_causes": bc.get("root_causes", {}),
+        }
 
     return stats
 

@@ -119,6 +119,54 @@ def print_report(stats: dict, rolling_stats: dict | None = None):
                 print(f"    {f['mod_key']}->{f['target_key']}: {f['count']} failures")
             print()
 
+    # Backspace chain analysis (root cause of errors)
+    if stats.get("backspace_chains"):
+        bc = stats["backspace_chains"]
+        print("ERROR ROOT CAUSE ANALYSIS")
+        print("-" * 40)
+        print(f"Total backspace chains (2+ consecutive): {bc.get('total_chains', 0)}")
+        print()
+
+        # Root causes
+        if bc.get("root_causes"):
+            print("  Identified patterns:")
+            cause_labels = {
+                "homerow_mod_misfire": "Homerow mod misfires (letter+shift before delete)",
+                "capslock_escape": "Capslock/Escape corrections",
+                "word_deletion": "Word deletions (typed wrong word)",
+            }
+            for cause, count in bc["root_causes"].items():
+                label = cause_labels.get(cause, cause)
+                print(f"    {label}: {count}")
+            print()
+
+        # What keys trigger corrections
+        if bc.get("immediate_before"):
+            print("  Keys immediately before backspace chains:")
+            items = list(bc["immediate_before"].items())[:10]
+            total = bc.get("total_chains", 1)
+            for key, count in items:
+                pct = count / total * 100
+                print(f"    {key:12} {count:4} ({pct:4.1f}%)")
+            print()
+
+        # 2-key sequences that lead to errors
+        if bc.get("sequences_before"):
+            print("  Key sequences leading to errors:")
+            items = list(bc["sequences_before"].items())[:10]
+            for seq, count in items:
+                if count >= 3:  # Only show significant patterns
+                    print(f"    {seq:20} {count:4}")
+            print()
+
+        # Chain length distribution
+        if bc.get("chain_lengths"):
+            print("  Backspace chain lengths:")
+            for length, count in sorted(bc["chain_lengths"].items(), key=lambda x: int(x[0]))[:6]:
+                bar = "█" * min(count // 5, 30)
+                print(f"    {length:2} backspaces: {count:4} {bar}")
+            print()
+
     # Long key holds (homerow mod debugging)
     if stats.get("long_holds"):
         print("LONG KEY HOLDS (potential homerow mod issues)")
