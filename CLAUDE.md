@@ -58,6 +58,25 @@ nix develop  # or: devenv shell
 pytest       # run tests
 ```
 
+## Typing Experiments
+
+The user tracks typing improvement experiments in `~/typing-experiments.md`. This file logs:
+- Baseline metrics before config changes
+- Kanata config changes (tap-time, hold-time, tap-hold strategies)
+- Results after changes (error rate, homerow mod failures)
+- Subjective feel and verdict
+
+**After making kanata config changes**, run `typing-report` to gather new metrics and update `~/typing-experiments.md` with the results.
+
+## Kanata Configuration
+
+Kanata homerow mod config is in: `/home/jevin/.config/nixpkgs/nixos/configuration.nix`
+
+Key settings to look for:
+- `tap-time` - How long before a key becomes a hold (default 150-200ms)
+- `hold-time` - How long to hold for modifier activation
+- `tap-hold-release-keys` - Achordion-style same-hand key lists
+
 ## Common Issues
 
 - **Permission denied on /dev/input/***: User not in `input` group
