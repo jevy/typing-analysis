@@ -97,6 +97,9 @@ def analyze(events: list[dict], session_gap: float = 60.0, long_hold_threshold_m
         result.total_keystrokes += 1
         ts = event["timestamp"]
         key = event["key"]
+        # Handle keys that evdev returns as lists (e.g., KEY_MUTE)
+        if isinstance(key, list):
+            key = key[-1] if key else "KEY_UNKNOWN"
 
         # Track hold durations from release events
         if event["event"] == "release" and "hold_duration_ms" in event:
@@ -294,7 +297,10 @@ def analyze_homerow_mods(events: list[dict], homerow_mods: dict = None) -> tuple
     press_events = [e for e in events if e["event"] == "press"]
 
     # Build list of (timestamp, key) for analysis
-    presses = [(e["timestamp"], e["key"]) for e in press_events]
+    # Normalize keys that evdev returns as lists
+    def normalize_key(k):
+        return k[-1] if isinstance(k, list) else k
+    presses = [(e["timestamp"], normalize_key(e["key"])) for e in press_events]
 
     # Track homerow mod -> target key sequences
     for i, (ts, key) in enumerate(presses):
